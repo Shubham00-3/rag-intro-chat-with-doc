@@ -1,38 +1,32 @@
 import os
-from dotenv import load_dotenv
 import chromadb
-from openai import OpenAI
 from chromadb.utils import embedding_functions
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 
-# Load environment variables from .env file
-load_dotenv()
+# Custom Ollama embedding function for ChromaDB
+class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
+    def __init__(self, model_name="nomic-embed-text"):
+        self.ollama_embeddings = OllamaEmbeddings(model=model_name)
+    
+    def __call__(self, texts):
+        embeddings = []
+        for text in texts:
+            embedding = self.ollama_embeddings.embed_query(text)
+            embeddings.append(embedding)
+        return embeddings
 
-openai_key = os.getenv("OPENAI_API_KEY")
+# Initialize the Ollama embedding function
+ollama_ef = OllamaEmbeddingFunction(model_name="nomic-embed-text")
 
-openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-    api_key=openai_key, model_name="text-embedding-3-small"
-)
 # Initialize the Chroma client with persistence
 chroma_client = chromadb.PersistentClient(path="chroma_persistent_storage")
 collection_name = "document_qa_collection"
 collection = chroma_client.get_or_create_collection(
-    name=collection_name, embedding_function=openai_ef
+    name=collection_name, embedding_function=ollama_ef
 )
 
-
-client = OpenAI(api_key=openai_key)
-
-# resp = client.chat.completions.create(
-#     model="gpt-3.5-turbo",
-#     messages=[
-#         {"role": "system", "content": "You are a helpful assistant."},
-#         {
-#             "role": "user",
-#             "content": "What is human life expectancy in the United States?",
-#         },
-#     ],
-# )
-
+# Initialize Ollama for text generation
+ollama_llm = ChatOllama(model="llama2")
 
 # Function to load documents from a directory
 def load_documents_from_directory(directory_path):
@@ -67,31 +61,26 @@ print(f"Loaded {len(documents)} documents")
 chunked_documents = []
 for doc in documents:
     chunks = split_text(doc["text"])
-    print("==== Splitting docs into chunks ====")
+    print(f"==== Splitting {doc['id']} into chunks ====")
     for i, chunk in enumerate(chunks):
         chunked_documents.append({"id": f"{doc['id']}_chunk{i+1}", "text": chunk})
 
-# print(f"Split documents into {len(chunked_documents)} chunks")
-
-
-# Function to generate embeddings using OpenAI API
-def get_openai_embedding(text):
-    response = client.embeddings.create(input=text, model="text-embedding-3-small")
-    embedding = response.data[0].embedding
+# Function to generate embeddings using Ollama
+def get_ollama_embedding(text):
+    # Using the same function we created for ChromaDB
+    embeddings = ollama_ef([text])
     print("==== Generating embeddings... ====")
-    return embedding
+    return embeddings[0]  # Return the first (and only) embedding
 
 
 # Generate embeddings for the document chunks
 for doc in chunked_documents:
-    print("==== Generating embeddings... ====")
-    doc["embedding"] = get_openai_embedding(doc["text"])
-
-# print(doc["embedding"])
+    print(f"==== Generating embeddings for {doc['id']}... ====")
+    doc["embedding"] = get_ollama_embedding(doc["text"])
 
 # Upsert documents with embeddings into Chroma
 for doc in chunked_documents:
-    print("==== Inserting chunks into db;;; ====")
+    print(f"==== Inserting chunk {doc['id']} into DB ====")
     collection.upsert(
         ids=[doc["id"]], documents=[doc["text"]], embeddings=[doc["embedding"]]
     )
@@ -99,20 +88,20 @@ for doc in chunked_documents:
 
 # Function to query documents
 def query_documents(question, n_results=2):
-    # query_embedding = get_openai_embedding(question)
+    print(f"==== Querying for: {question} ====")
     results = collection.query(query_texts=question, n_results=n_results)
 
     # Extract the relevant chunks
-    relevant_chunks = [doc for sublist in results["documents"] for doc in sublist]
-    print("==== Returning relevant chunks ====")
+    relevant_chunks = []
+    if results["documents"] and len(results["documents"]) > 0:
+        for doc in results["documents"][0]:
+            relevant_chunks.append(doc)
+    
+    print(f"==== Found {len(relevant_chunks)} relevant chunks ====")
     return relevant_chunks
-    # for idx, document in enumerate(results["documents"][0]):
-    #     doc_id = results["ids"][0][idx]
-    #     distance = results["distances"][0][idx]
-    #     print(f"Found document chunk: {document} (ID: {doc_id}, Distance: {distance})")
 
 
-# Function to generate a response from OpenAI
+# Function to generate a response using Ollama
 def generate_response(question, relevant_chunks):
     context = "\n\n".join(relevant_chunks)
     prompt = (
@@ -122,29 +111,44 @@ def generate_response(question, relevant_chunks):
         "\n\nContext:\n" + context + "\n\nQuestion:\n" + question
     )
 
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {
-                "role": "system",
-                "content": prompt,
-            },
-            {
-                "role": "user",
-                "content": question,
-            },
-        ],
-    )
-
-    answer = response.choices[0].message
-    return answer
+    print("==== Generating response with Ollama ====")
+    response = ollama_llm.invoke(prompt)
+    
+    # Return content directly as a string (Ollama response structure is different)
+    return response.content
 
 
-# Example query
-# query_documents("tell me about AI replacing TV writers strike.")
-# Example query and response generation
-question = "tell me about databricks"
-relevant_chunks = query_documents(question)
-answer = generate_response(question, relevant_chunks)
+# Interactive mode
+def interactive_mode():
+    print("\n==== RAG Chat with Documents - Interactive Mode ====")
+    print("Type 'exit' to quit")
+    
+    while True:
+        user_question = input("\nEnter your question: ")
+        
+        if user_question.lower() == 'exit':
+            print("Goodbye!")
+            break
+        
+        # Process the question
+        relevant_chunks = query_documents(user_question)
+        
+        if not relevant_chunks:
+            print("No relevant information found.")
+            continue
+        
+        answer = generate_response(user_question, relevant_chunks)
+        
+        print("\nAnswer:")
+        print(answer)
 
-print(answer)
+
+# Example query and response generation (or comment this out and use interactive mode)
+# question = "tell me about databricks"
+# relevant_chunks = query_documents(question)
+# answer = generate_response(question, relevant_chunks)
+# print(answer)
+
+# Run in interactive mode instead
+if __name__ == "__main__":
+    interactive_mode()
